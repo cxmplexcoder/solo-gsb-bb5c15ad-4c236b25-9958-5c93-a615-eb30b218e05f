@@ -505,6 +505,165 @@ def delete_batch(conn: sqlite3.Connection, batch_id: str) -> None:
         raise
 
 
+# ---------- 单批次采集质量审查 ----------
+
+# 稳定告警代码：含义与触发阈值固定，仅随版本演进新增、不复用旧代码
+ALERT_DUP_RATE_HIGH = "DUP_RATE_HIGH"
+ALERT_FRAMES_OUT_OF_RANGE = "FRAMES_OUT_OF_RANGE"
+ALERT_GAP_TOO_LONG = "GAP_TOO_LONG"
+
+# 触发阈值（固定规则，保证同一批数据在任何时刻审查结果一致）
+DUP_RATE_THRESHOLD = 0.10   # 批内重复率严格大于 0.10 触发
+GAP_FRAMES_THRESHOLD = 5    # 预期范围内最长缺口帧数达到 5 触发
+
+
+def _longest_run(nums: list[int]) -> tuple[int, int] | None:
+    """排序帧号序列中最长的连续段，返回 (start, end)；并列取起点（帧号）最小者。"""
+    best: tuple[int, int] | None = None
+    run_start: int | None = None
+    prev: int | None = None
+    for f in nums:
+        if run_start is None:
+            run_start = prev = f
+        elif f == prev + 1:
+            prev = f
+        else:
+            if best is None or prev - run_start > best[1] - best[0]:
+                best = (run_start, prev)
+            run_start = prev = f
+    if run_start is not None:
+        if best is None or prev - run_start > best[1] - best[0]:
+            best = (run_start, prev)
+    return best
+
+
+def batch_quality_metrics(
+    raw_frames: list[int], expected_start: int, expected_end: int
+) -> dict:
+    """按**原始顺序**单趟扫描计算单个批次的采集质量指标（纯函数，便于测试）。
+
+    - 批内重复率 =（原始帧数 − 不同帧数）/ 原始帧数；重复帧去重后按首次出现顺序列出；
+    - 越界帧：不落在本批预期闭区间 [expected_start, expected_end] 内的帧，
+      去重后按原始列表首次出现顺序列出（不按帧号排序，以保留采集顺序信息）；
+    - 最长连续扫到段：原始列表去重后压缩成连续闭区间，帧数最多者（并列取帧号最小段）；
+    - 预期范围内最长缺口：预期闭区间扣除本批扫到的点后最长的连续缺口，
+      **含首尾边界缺口**（并列取帧号最小段）；预期范围全覆盖时为 None；
+    - 段数：去重帧集合压缩成连续闭区间后的段数（含落在预期外的段）。
+    """
+    total = len(raw_frames)
+    distinct = set(raw_frames)
+
+    # 单趟扫描：重复帧、越界帧都按原始列表首次出现顺序收集
+    seen: set[int] = set()
+    dup_set: set[int] = set()
+    duplicate_frames: list[int] = []
+    out_of_range_frames: list[int] = []
+    for f in raw_frames:
+        if f in seen:
+            if f not in dup_set:
+                dup_set.add(f)
+                duplicate_frames.append(f)
+        else:
+            seen.add(f)
+            if not (expected_start <= f <= expected_end):
+                out_of_range_frames.append(f)
+
+    segments = frames_to_ranges(distinct)
+    longest = _longest_run(sorted(distinct))
+
+    gaps = _subtract_merged(
+        [(expected_start, expected_end)],
+        segments,  # frames_to_ranges 的输出已是合并、升序的闭区间
+    )
+    longest_gap: tuple[int, int] | None = None
+    for s, e in gaps:  # 已按起点升序，严格大于才替换 => 并列保留帧号最小段
+        if longest_gap is None or (e - s) > (longest_gap[1] - longest_gap[0]):
+            longest_gap = (s, e)
+
+    duplicate_rate = (total - len(distinct)) / total if total else 0.0
+
+    # 固定顺序的稳定告警代码：重复率 > 0.10、存在越界帧、缺口 ≥ 5 帧
+    alerts: list[str] = []
+    if duplicate_rate > DUP_RATE_THRESHOLD:
+        alerts.append(ALERT_DUP_RATE_HIGH)
+    if out_of_range_frames:
+        alerts.append(ALERT_FRAMES_OUT_OF_RANGE)
+    if longest_gap is not None and (
+        longest_gap[1] - longest_gap[0] + 1
+    ) >= GAP_FRAMES_THRESHOLD:
+        alerts.append(ALERT_GAP_TOO_LONG)
+
+    return {
+        "total": total,
+        "distinct": len(distinct),
+        "duplicate_rate": duplicate_rate,
+        "duplicate_frames": duplicate_frames,
+        "out_of_range_frames": out_of_range_frames,
+        "longest_scanned_segment": longest,
+        "longest_gap": longest_gap,
+        "segment_count": len(segments),
+        "alerts": alerts,
+    }
+
+
+def get_batch_quality(
+    conn: sqlite3.Connection, batch_id: str
+) -> schemas.BatchQualityOut:
+    """在一次只读事务中审查单个批次的采集质量，不修改批次或胶卷汇总。
+
+    - 批次不存在：抛 BatchNotFoundError（接口返回 404）；
+    - 缺少原始帧列表的旧批次（raw_frames_json IS NULL）：抛 LegacyBatchDataError
+      （接口按旧数据规则返回 409）——旧数据只存去重集合，无法计算批内重复率、
+      采集顺序等指标，不做推断。
+    """
+    conn.execute("BEGIN")
+    try:
+        row = conn.execute(
+            """SELECT id, roll_no, expected_start, expected_end, raw_frames_json
+                 FROM batches WHERE id = ?""",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            raise BatchNotFoundError(batch_id)
+        if row["raw_frames_json"] is None:
+            raise LegacyBatchDataError([row["id"]])
+        raw_frames = json.loads(row["raw_frames_json"])
+        expected_start = row["expected_start"]
+        expected_end = row["expected_end"]
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    m = batch_quality_metrics(raw_frames, expected_start, expected_end)
+    s, e = m["longest_scanned_segment"]
+    return schemas.BatchQualityOut(
+        batch_id=row["id"],
+        roll_no=row["roll_no"],
+        expected_start=expected_start,
+        expected_end=expected_end,
+        raw_frame_count=m["total"],
+        distinct_frame_count=m["distinct"],
+        duplicate_rate=m["duplicate_rate"],
+        duplicate_frames=m["duplicate_frames"],
+        out_of_range_frames=m["out_of_range_frames"],
+        longest_scanned_segment=schemas.QualitySegment(
+            start=s, end=e, frame_count=e - s + 1
+        ),
+        longest_gap=(
+            schemas.QualitySegment(
+                start=m["longest_gap"][0],
+                end=m["longest_gap"][1],
+                frame_count=m["longest_gap"][1] - m["longest_gap"][0] + 1,
+            )
+            if m["longest_gap"] is not None
+            else None
+        ),
+        segment_count=m["segment_count"],
+        alerts=m["alerts"],
+    )
+
+
 # ---------- 补扫任务认领 ----------
 
 class RollNotFoundError(Exception):

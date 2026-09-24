@@ -68,6 +68,54 @@ class BatchMeta(BaseModel):
     created_at: str
 
 
+class QualitySegment(BaseModel):
+    start: int = Field(..., description="连续闭区间起始帧号（含）")
+    end: int = Field(..., description="连续闭区间结束帧号（含）")
+    frame_count: int = Field(..., description="该段包含的帧数（end − start + 1）")
+
+
+class BatchQualityOut(BaseModel):
+    batch_id: str
+    roll_no: str
+    expected_start: int = Field(..., description="该批次保存的预期闭区间起始（含）")
+    expected_end: int = Field(..., description="该批次保存的预期闭区间结束（含）")
+    raw_frame_count: int = Field(
+        ..., description="原始帧列表长度（含批内重复、按提交顺序）"
+    )
+    distinct_frame_count: int = Field(..., description="去重后的不同帧号数量")
+    duplicate_rate: float = Field(
+        ...,
+        description="批内重复率 =（原始帧数 − 去重帧数）/ 原始帧数，取值 [0, 1)",
+    )
+    duplicate_frames: list[int] = Field(
+        ..., description="在原始列表中出现超过一次的帧号，去重后按**首次出现顺序**排列"
+    )
+    out_of_range_frames: list[int] = Field(
+        ...,
+        description="不落在该批次预期闭区间 [expected_start, expected_end] 内的帧，"
+        "去重后按**原始列表首次出现顺序**排列（不按帧号排序）",
+    )
+    longest_scanned_segment: QualitySegment = Field(
+        ...,
+        description="原始列表去重后压缩成连续段时，帧数最多的连续扫到段"
+        "（并列时取帧号最小的段）",
+    )
+    longest_gap: QualitySegment | None = Field(
+        ...,
+        description="预期闭区间内、未被本批扫到的最长连续缺口（含首尾边界缺口，"
+        "并列时取帧号最小的段）；预期范围已全部扫到时为 null",
+    )
+    segment_count: int = Field(
+        ..., description="把原始列表去重后压缩成连续闭区间后的段数（含落在预期外的段）"
+    )
+    alerts: list[str] = Field(
+        ...,
+        description="稳定告警代码（固定顺序）：DUP_RATE_HIGH=批内重复率 > 0.10；"
+        "FRAMES_OUT_OF_RANGE=存在落在预期闭区间外的帧；"
+        "GAP_TOO_LONG=预期范围内最长缺口帧数 ≥ 5；无告警时为空列表",
+    )
+
+
 class RollSummary(BaseModel):
     roll_no: str
     total_frames: int
