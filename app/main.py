@@ -20,8 +20,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="胶片档案扫描整理 API",
-    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照及相对快照的区间级差异对比。",
-    version="1.5.0",
+    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照及相对快照的区间级差异对比；支持单批次采集质量审查（批内重复率、越界帧、预期内缺口及稳定告警代码）。",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -60,6 +60,34 @@ def get_batch(batch_id: str, conn: Connection = Depends(database.get_db)):
     if result is None:
         raise HTTPException(status_code=404, detail="批次不存在")
     return result
+
+
+@app.get(
+    "/batches/{batch_id}/quality",
+    response_model=schemas.BatchQualityOut,
+    tags=["批次"],
+)
+def get_batch_quality(batch_id: str, conn: Connection = Depends(database.get_db)):
+    """审查单个扫描批次的采集质量（只读，不修改批次或胶卷汇总）。
+
+    在一次只读事务中读取该批保存的原始帧列表与预期闭区间，按原始顺序计算：
+    批内重复率、落在预期外的帧、最长连续扫到段、预期范围内的最长缺口、
+    原始列表压缩成连续段后的段数，并给出按重复率、越界帧和缺口长度触发的
+    稳定告警代码。批次不存在返回 404；旧版批次缺少原始帧列表时按旧数据
+    规则返回 409。
+    """
+    try:
+        return services.get_batch_quality(conn, batch_id.strip())
+    except services.BatchNotFoundError:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    except services.LegacyBatchDataError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "该批次为旧版数据，缺少原始帧列表，无法按原始顺序评估采集质量"
+                f"（相关批次：{', '.join(e.legacy_batch_ids)}）。"
+            ),
+        )
 
 
 @app.delete(

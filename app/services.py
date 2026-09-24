@@ -90,6 +90,22 @@ def frames_to_ranges(frames) -> list[tuple[int, int]]:
     return result
 
 
+def raw_list_segments(frames: list[int]) -> list[tuple[int, int]]:
+    """把**原始帧列表**（保序、含批内重复）按扫描顺序压缩成连续闭区间段。
+
+    逐帧扫描：与上一帧相同（重扫）或恰好 +1 时并入当前段，否则开启新段。
+    例如 [1, 2, 2, 3, 9] -> [(1, 3), (9, 9)]。与 frames_to_ranges 不同，
+    本函数不排序、不去重，专用于按采集顺序评估扫描连续性。
+    """
+    segments: list[list[int]] = []
+    for f in frames:
+        if segments and f in (segments[-1][1], segments[-1][1] + 1):
+            segments[-1][1] = max(segments[-1][1], f)
+        else:
+            segments.append([f, f])
+    return [(s, e) for s, e in segments]
+
+
 def _subtract_merged(
     a: list[tuple[int, int]], b: list[tuple[int, int]]
 ) -> list[tuple[int, int]]:
@@ -503,6 +519,107 @@ def delete_batch(conn: sqlite3.Connection, batch_id: str) -> None:
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+# ---------- 批次采集质量 ----------
+
+# 稳定告警代码（对外契约，客户端可依赖，勿随意改动）
+ALERT_HIGH_DUPLICATE_RATE = "HIGH_DUPLICATE_RATE"
+ALERT_FRAMES_OUT_OF_RANGE = "FRAMES_OUT_OF_RANGE"
+ALERT_LONG_MISSING_GAP = "LONG_MISSING_GAP"
+
+# 告警阈值：批内重复率达到 0.2、预期内最长缺口达到 10 帧时触发；越界帧出现即触发
+QUALITY_DUPLICATE_RATE_THRESHOLD = 0.2
+QUALITY_GAP_LENGTH_THRESHOLD = 10
+
+
+def get_batch_quality(
+    conn: sqlite3.Connection, batch_id: str
+) -> schemas.BatchQualityOut:
+    """审查单个批次的采集质量。只读接口，不修改批次或胶卷汇总。
+
+    在一次只读事务中读取该批保存的原始帧列表（含批内重复、保序）与预期
+    闭区间，按原始顺序计算：批内重复率、落在预期外的帧、最长连续扫到段、
+    预期范围内的最长缺口、原始列表压缩成连续段后的段数，并按阈值给出
+    稳定告警代码。指标只针对该批次本身，与胶卷合并状态无关。
+
+    - 批次不存在 → BatchNotFoundError（接口返回 404）；
+    - 旧版批次缺少原始帧列表 → LegacyBatchDataError（接口按旧数据规则返回 409）。
+    """
+    conn.execute("BEGIN")
+    try:
+        r = conn.execute(
+            """SELECT id, roll_no, expected_start, expected_end,
+                      raw_frames_json, created_at
+                 FROM batches WHERE id = ?""",
+            (batch_id,),
+        ).fetchone()
+        if r is None:
+            raise BatchNotFoundError(batch_id)
+        if r["raw_frames_json"] is None:
+            # 旧版批次只保存去重后的帧集合，无法按原始顺序评估采集质量
+            raise LegacyBatchDataError([r["id"]])
+        raw_frames: list[int] = json.loads(r["raw_frames_json"])
+
+        frame_count = len(raw_frames)
+        unique = set(raw_frames)
+        duplicate_rate = (
+            round((frame_count - len(unique)) / frame_count, 4)
+            if frame_count
+            else 0.0
+        )
+
+        exp_start, exp_end = r["expected_start"], r["expected_end"]
+        out_of_range = sorted(
+            f for f in unique if not (exp_start <= f <= exp_end)
+        )
+
+        # 按原始顺序压缩连续段：段数与最长连续扫到段（并列取先出现者）
+        segments = raw_list_segments(raw_frames)
+        longest_run = max(segments, key=lambda seg: seg[1] - seg[0], default=None)
+        # 预期闭区间内的缺帧段：最长缺口（并列取帧号最小者）
+        gaps = missing_intervals([(exp_start, exp_end)], unique)
+        longest_gap = max(gaps, key=lambda seg: seg[1] - seg[0], default=None)
+        longest_gap_length = (
+            longest_gap[1] - longest_gap[0] + 1 if longest_gap else 0
+        )
+
+        alerts: list[str] = []
+        if duplicate_rate >= QUALITY_DUPLICATE_RATE_THRESHOLD:
+            alerts.append(ALERT_HIGH_DUPLICATE_RATE)
+        if out_of_range:
+            alerts.append(ALERT_FRAMES_OUT_OF_RANGE)
+        if longest_gap_length >= QUALITY_GAP_LENGTH_THRESHOLD:
+            alerts.append(ALERT_LONG_MISSING_GAP)
+
+        out = schemas.BatchQualityOut(
+            batch_id=r["id"],
+            roll_no=r["roll_no"],
+            expected_start=exp_start,
+            expected_end=exp_end,
+            frame_count=frame_count,
+            unique_frame_count=len(unique),
+            duplicate_rate=duplicate_rate,
+            out_of_range_frames=out_of_range,
+            longest_scanned_run=list(longest_run) if longest_run else None,
+            longest_scanned_run_length=(
+                longest_run[1] - longest_run[0] + 1 if longest_run else 0
+            ),
+            longest_gap=list(longest_gap) if longest_gap else None,
+            longest_gap_length=longest_gap_length,
+            segment_count=len(segments),
+            alerts=alerts,
+            alert_thresholds=schemas.QualityAlertThresholds(
+                duplicate_rate=QUALITY_DUPLICATE_RATE_THRESHOLD,
+                gap_length=QUALITY_GAP_LENGTH_THRESHOLD,
+            ),
+            created_at=r["created_at"],
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return out
 
 
 # ---------- 补扫任务认领 ----------

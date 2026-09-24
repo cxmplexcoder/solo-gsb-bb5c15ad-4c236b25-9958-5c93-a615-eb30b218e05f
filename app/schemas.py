@@ -47,6 +47,52 @@ class BatchResult(BaseModel):
     created_at: str | None = None
 
 
+class QualityAlertThresholds(BaseModel):
+    duplicate_rate: float = Field(
+        ..., description="批内重复率告警阈值（达到即触发 HIGH_DUPLICATE_RATE）"
+    )
+    gap_length: int = Field(
+        ..., description="预期内最长缺口告警阈值（帧数，达到即触发 LONG_MISSING_GAP）"
+    )
+
+
+class BatchQualityOut(BaseModel):
+    batch_id: str
+    roll_no: str
+    expected_start: int = Field(..., description="本批预期帧号起始（含）")
+    expected_end: int = Field(..., description="本批预期帧号结束（含）")
+    frame_count: int = Field(..., description="原始帧列表长度（含批内重复）")
+    unique_frame_count: int = Field(..., description="去重后的帧数")
+    duplicate_rate: float = Field(
+        ...,
+        description="批内重复率 = (frame_count − unique_frame_count) / frame_count，保留 4 位小数",
+    )
+    out_of_range_frames: list[int] = Field(
+        ..., description="落在本批预期闭区间之外的帧（去重排序）"
+    )
+    longest_scanned_run: list[int] | None = Field(
+        ...,
+        description="按原始顺序压缩出的最长连续扫到段 [start, end]（闭区间，并列取先出现者）",
+    )
+    longest_scanned_run_length: int = Field(..., description="最长连续扫到段长度（帧数）")
+    longest_gap: list[int] | None = Field(
+        ..., description="预期闭区间内的最长缺帧段 [start, end]（并列取帧号最小者）；无缺口为 null"
+    )
+    longest_gap_length: int = Field(..., description="预期闭区间内最长缺口长度（帧数）")
+    segment_count: int = Field(
+        ..., description="原始帧列表按原始顺序压缩成连续段后的段数"
+    )
+    alerts: list[str] = Field(
+        ...,
+        description="稳定告警代码，按阈值触发：HIGH_DUPLICATE_RATE（批内重复率）、"
+        "FRAMES_OUT_OF_RANGE（越界帧）、LONG_MISSING_GAP（预期内缺口长度）",
+    )
+    alert_thresholds: QualityAlertThresholds = Field(
+        ..., description="本次评估使用的告警阈值"
+    )
+    created_at: str = Field(..., description="批次导入时间（UTC ISO-8601）")
+
+
 class RollState(BaseModel):
     roll_no: str
     expected_ranges: list[list[int]]
